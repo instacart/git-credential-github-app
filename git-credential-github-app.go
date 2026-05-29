@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
@@ -18,6 +19,19 @@ import (
 )
 
 var version = "v0.0.1"
+
+const (
+	retryMax     = 4
+	retryWaitMin = 1 * time.Second
+	retryWaitMax = 30 * time.Second
+
+	// Hard ceilings on total wall-clock time (including retry backoff) so a
+	// misbehaving server can never hang git indefinitely. The get path is in
+	// git's critical path and kept tighter; generate is an interactive,
+	// one-shot command that may paginate, so it gets more headroom.
+	getTimeout      = 60 * time.Second
+	generateTimeout = 2 * time.Minute
+)
 
 type CredHelperArgs struct {
 	AppId          int64
@@ -89,9 +103,11 @@ func newRetryableTransport() http.RoundTripper {
 // It is factored out so tests can adjust the backoff timings.
 func newRetryableClient() *retryablehttp.Client {
 	retryClient := retryablehttp.NewClient()
-	retryClient.RetryMax = 4
-	retryClient.RetryWaitMin = 1 * time.Second
-	retryClient.RetryWaitMax = 30 * time.Second
+	retryClient.RetryMax = retryMax
+	retryClient.RetryWaitMin = retryWaitMin
+	retryClient.RetryWaitMax = retryWaitMax
+	retryClient.CheckRetry = githubRetryPolicy
+	retryClient.Backoff = cappedBackoff
 	// Suppress the library's verbose per-request logging; emit a brief warning
 	// to stderr only when a request is actually being retried.
 	retryClient.Logger = nil
@@ -102,6 +118,49 @@ func newRetryableClient() *retryablehttp.Client {
 		}
 	}
 	return retryClient
+}
+
+// githubRetryPolicy extends retryablehttp's default policy (network errors, 429,
+// and 5xx except 501) to also retry GitHub's secondary rate-limit responses,
+// which arrive as 403 with a Retry-After header. Primary rate-limit 403s (no
+// Retry-After, reset potentially an hour away) are deliberately not retried so
+// git fails fast rather than hanging.
+func githubRetryPolicy(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	shouldRetry, checkErr := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+	if shouldRetry || checkErr != nil {
+		return shouldRetry, checkErr
+	}
+	if resp != nil && resp.StatusCode == http.StatusForbidden {
+		if _, ok := resp.Header["Retry-After"]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// cappedBackoff honors a server-supplied Retry-After header (seconds) for 403,
+// 429, and 503 responses but never waits longer than retryWaitMax, and otherwise
+// falls back to exponential backoff. This guarantees a bounded per-attempt wait
+// even when a server requests a very long (or HTTP-date) Retry-After delay.
+func cappedBackoff(min, max time.Duration, attemptNum int, resp *http.Response) time.Duration {
+	if resp != nil {
+		switch resp.StatusCode {
+		case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil {
+				return capDuration(time.Duration(secs)*time.Second, max)
+			}
+		}
+	}
+	// DefaultBackoff returns an uncapped Retry-After for HTTP-date headers, so
+	// cap its result too.
+	return capDuration(retryablehttp.DefaultBackoff(min, max, attemptNum, resp), max)
+}
+
+func capDuration(d, max time.Duration) time.Duration {
+	if d > max {
+		return max
+	}
+	return d
 }
 
 func newGithubAppClient(tr http.RoundTripper, appId int64, privateKeyFile, domain string) (*github.Client, error) {
@@ -126,7 +185,8 @@ func doGet(w io.Writer, args *CredHelperArgs) {
 	if err != nil {
 		log.Fatal("Error creating client: ", err)
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), getTimeout)
+	defer cancel()
 
 	if args.InstallationId == 0 {
 		installation, _, err := client.Apps.FindOrganizationInstallation(ctx, args.Organization)
@@ -148,7 +208,8 @@ func doGenerate(w io.Writer, args *CredHelperArgs) {
 	if err != nil {
 		log.Fatal("Error creating client: ", err)
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), generateTimeout)
+	defer cancel()
 
 	var allInstallations []*github.Installation
 	opt := github.ListOptions{PerPage: 10}

@@ -28,14 +28,25 @@ Use `github.com/hashicorp/go-retryablehttp`.
 
 - New helper `newRetryableTransport()` returns an `http.RoundTripper` built from
   `retryablehttp.NewClient()`:
-  - `RetryMax = 4`, `RetryWaitMin = 1s`, `RetryWaitMax = 30s`, exponential
-    backoff with jitter (library defaults — bounded worst-case wait ~30–45s).
-  - `DefaultRetryPolicy` retries on 5XX (except 501), 429, and network errors;
-    `DefaultBackoff` honors `Retry-After` on 429/503.
+  - `RetryMax = 4`, `RetryWaitMin = 1s`, `RetryWaitMax = 30s`.
+  - Custom retry policy (`githubRetryPolicy`): extends `DefaultRetryPolicy`
+    (5XX except 501, 429, network errors) to also retry GitHub's secondary
+    rate-limit responses, which arrive as **403 with a `Retry-After` header**.
+    Primary rate-limit 403s (no `Retry-After`, reset potentially an hour away)
+    are deliberately **not** retried so git fails fast instead of hanging.
+  - Custom backoff (`cappedBackoff`): honors a server-supplied `Retry-After`
+    (seconds) for 403/429/503 but **caps every wait at `RetryWaitMax`**, and
+    caps the HTTP-date path of `DefaultBackoff` too. This is the key fix for the
+    library default, which returns `Retry-After` uncapped and could otherwise
+    block git for minutes.
   - `Logger = nil` to suppress default per-request chatter; a `RequestLogHook`
     logs a brief stderr warning only when `attempt > 0`.
 - Wire it into `newGithubAppClient` in place of `http.DefaultTransport`. Both
   `doGet` and `doGenerate` benefit automatically.
+- Each entry point wraps its context with a hard deadline as a final ceiling:
+  `getTimeout = 60s` (git's critical path) and `generateTimeout = 2m` (interactive,
+  paginating command). Once the deadline passes, retries stop and the failure
+  surfaces through the existing fatal paths.
 
 ## Error handling
 
