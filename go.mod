@@ -5,10 +5,12 @@ go 1.25.5
 require (
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/google/go-github/v75 v75.0.0
+	github.com/hashicorp/go-retryablehttp v0.7.8
 )
 
 require (
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/go-github/v84 v84.0.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
+	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 )

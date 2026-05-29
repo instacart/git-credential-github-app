@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v75/github"
+	"github.com/hashicorp/go-retryablehttp"
 )
 
 var version = "v0.0.1"
@@ -75,6 +77,33 @@ func generateGitConfig(w io.Writer, installations []*github.Installation, args *
 	fmt.Fprintf(w, "[url \"https://%s\"]\n\tinsteadOf = ssh://git@github.com\n", domain)
 }
 
+// newRetryableTransport returns an http.RoundTripper that transparently retries
+// requests that fail with transient errors: 5XX server responses (except 501),
+// 429 rate limiting (honoring Retry-After), and network-level errors. Retries
+// use exponential backoff with jitter and are bounded by RetryMax.
+func newRetryableTransport() http.RoundTripper {
+	return newRetryableClient().StandardClient().Transport
+}
+
+// newRetryableClient builds the retrying HTTP client used by newRetryableTransport.
+// It is factored out so tests can adjust the backoff timings.
+func newRetryableClient() *retryablehttp.Client {
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = 4
+	retryClient.RetryWaitMin = 1 * time.Second
+	retryClient.RetryWaitMax = 30 * time.Second
+	// Suppress the library's verbose per-request logging; emit a brief warning
+	// to stderr only when a request is actually being retried.
+	retryClient.Logger = nil
+	retryClient.RequestLogHook = func(_ retryablehttp.Logger, req *http.Request, attempt int) {
+		if attempt > 0 {
+			fmt.Fprintf(os.Stderr, "retrying request (attempt %d/%d): %s %s\n",
+				attempt, retryClient.RetryMax, req.Method, req.URL.Path)
+		}
+	}
+	return retryClient
+}
+
 func newGithubAppClient(tr http.RoundTripper, appId int64, privateKeyFile, domain string) (*github.Client, error) {
 	atr, err := ghinstallation.NewAppsTransportKeyFromFile(tr, appId, privateKeyFile)
 	if err != nil {
@@ -93,7 +122,7 @@ func newGithubAppClient(tr http.RoundTripper, appId int64, privateKeyFile, domai
 }
 
 func doGet(w io.Writer, args *CredHelperArgs) {
-	client, err := newGithubAppClient(http.DefaultTransport, args.AppId, args.PrivateKeyFile, args.Domain)
+	client, err := newGithubAppClient(newRetryableTransport(), args.AppId, args.PrivateKeyFile, args.Domain)
 	if err != nil {
 		log.Fatal("Error creating client: ", err)
 	}
@@ -115,7 +144,7 @@ func doGet(w io.Writer, args *CredHelperArgs) {
 }
 
 func doGenerate(w io.Writer, args *CredHelperArgs) {
-	client, err := newGithubAppClient(http.DefaultTransport, args.AppId, args.PrivateKeyFile, args.Domain)
+	client, err := newGithubAppClient(newRetryableTransport(), args.AppId, args.PrivateKeyFile, args.Domain)
 	if err != nil {
 		log.Fatal("Error creating client: ", err)
 	}
